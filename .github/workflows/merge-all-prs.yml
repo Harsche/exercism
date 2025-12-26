@@ -14,12 +14,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Rebase and Merge all open PRs
+      - name: Rebase and Merge all open PRs (Oldest First)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Get a list of all open PR numbers
-          PR_LIST=$(gh pr list --state open --json number --jq '.[].number')
+          # 1. Get open PRs, sorted by created date in ascending order (oldest first)
+          # We set a high limit (e.g., 1000) to ensure we capture all open PRs
+          PR_LIST=$(gh pr list --state open --limit 1000 --json number,createdAt --jq 'sort_by(.createdAt) | .[].number')
 
           if [ -z "$PR_LIST" ]; then
             echo "No open pull requests found."
@@ -27,15 +28,15 @@ jobs:
           fi
 
           for PR in $PR_LIST; do
-            echo "Processing PR #$PR..."
+            echo "-----------------------------------"
+            echo "Processing oldest PR: #$PR"
 
             # 2. Attempt to rebase and merge
-            # --delete-branch automatically deletes the head branch after merge
             if gh pr merge $PR --rebase --delete-branch; then
               echo "Successfully merged PR #$PR"
             else
-              echo "Failed to merge PR #$PR. This might be due to conflicts or failing checks."
-              echo "Stopping execution as requested."
+              echo "Error: Failed to merge PR #$PR."
+              echo "Stopping execution to prevent out-of-order merging or conflict issues."
               exit 1
             fi
           done
