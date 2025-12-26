@@ -1,0 +1,41 @@
+name: Merge All Pull Requests
+
+on:
+  workflow_dispatch: # Allows manual trigger from the UI
+
+jobs:
+  merge-prs:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Rebase and Merge all open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Get a list of all open PR numbers
+          PR_LIST=$(gh pr list --state open --json number --jq '.[].number')
+
+          if [ -z "$PR_LIST" ]; then
+            echo "No open pull requests found."
+            exit 0
+          fi
+
+          for PR in $PR_LIST; do
+            echo "Processing PR #$PR..."
+
+            # 2. Attempt to rebase and merge
+            # --delete-branch automatically deletes the head branch after merge
+            if gh pr merge $PR --rebase --delete-branch; then
+              echo "Successfully merged PR #$PR"
+            else
+              echo "Failed to merge PR #$PR. This might be due to conflicts or failing checks."
+              echo "Stopping execution as requested."
+              exit 1
+            fi
+          done
