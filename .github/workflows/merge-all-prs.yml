@@ -3,14 +3,14 @@ name: Merge All Pull Requests
 on: 
   workflow_dispatch: 
 
-jobs:
+jobs: 
   merge-all-prs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents:  write
     
-    steps:
+    steps: 
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -18,7 +18,7 @@ jobs:
       
       - name: Merge PRs sequentially
         env:
-          GH_TOKEN: ${{ secrets. GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Fetching all open PRs sorted by creation date..."
           
@@ -38,15 +38,15 @@ jobs:
             echo "Processing PR #$pr_number"
             echo "========================================="
             
-            # Get branch names
-            head_branch=$(gh pr view "$pr_number" --json headRefName --jq '. headRefName')
+            # Get branch names using different jq syntax
+            head_branch=$(gh pr view "$pr_number" --json headRefName --jq '.headRefName')
             base_branch=$(gh pr view "$pr_number" --json baseRefName --jq '.baseRefName')
             
             echo "PR #$pr_number: $head_branch -> $base_branch"
             
             # Verify we got the branch names
             if [ -z "$head_branch" ] || [ -z "$base_branch" ]; then
-              echo "ERROR: Failed to get branch names for PR #$pr_number"
+              echo "ERROR:  Failed to get branch names for PR #$pr_number"
               exit 1
             fi
             
@@ -70,7 +70,7 @@ jobs:
             
             # Push the rebased branch
             echo "Pushing rebased branch..."
-            if ! git push origin "$head_branch" --force-with-lease; then
+            if !  git push origin "$head_branch" --force-with-lease; then
               echo "ERROR: Failed to push rebased branch for PR #$pr_number"
               exit 1
             fi
