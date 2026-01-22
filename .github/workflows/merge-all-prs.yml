@@ -1,90 +1,107 @@
 name: Merge All Pull Requests
 
-on:  
-  workflow_dispatch: # Allows manual trigger from the UI
+on: 
+  workflow_dispatch: 
 
-jobs: 
-  merge-prs: 
+jobs:
+  merge-all-prs:
     runs-on: ubuntu-latest
-    permissions:   
+    permissions:
       pull-requests: write
       contents:  write
-
-    steps: 
-      - name:  Checkout repository
+    
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for all branches
-
-      - name:  Rebase and Merge all open PRs (Oldest First)
+          fetch-depth: 0
+      
+      - name: Merge PRs sequentially
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets. GITHUB_TOKEN }}
         run: |
-          # 1. Get open PRs, sorted by created date in ascending order (oldest first)
-          PR_LIST=$(gh pr list --state open --limit 1000 --json number,createdAt --jq 'sort_by(.createdAt) | .[].number')
-
-          if [ -z "$PR_LIST" ]; then
-            echo "No open pull requests found."
+          echo "Fetching all open PRs sorted by creation date..."
+          
+          # Get list of PR numbers, oldest first
+          prs=$(gh pr list --state open --limit 1000 --json number,createdAt --jq 'sort_by(.createdAt) | .[].number')
+          
+          if [ -z "$prs" ]; then
+            echo "No open PRs found"
             exit 0
           fi
-
-          for PR in $PR_LIST; do
-            echo "-----------------------------------"
-            echo "Processing oldest PR: #$PR"
-
-            # 2. Get PR branch information
-            echo "Getting PR #$PR branch information..."
-            HEAD_BRANCH=$(gh pr view $PR --json headRefName -q '. headRefName')
-            BASE_BRANCH=$(gh pr view $PR --json baseRefName -q '. baseRefName')
+          
+          echo "Found PRs to merge:  $prs"
+          echo ""
+          
+          for pr_number in $prs; do
+            echo "========================================="
+            echo "Processing PR #$pr_number"
+            echo "========================================="
             
-            echo "Head branch:  $HEAD_BRANCH"
-            echo "Base branch: $BASE_BRANCH"
+            # Get branch names
+            head_branch=$(gh pr view "$pr_number" --json headRefName --jq '. headRefName')
+            base_branch=$(gh pr view "$pr_number" --json baseRefName --jq '.baseRefName')
             
-            if [ -z "$HEAD_BRANCH" ] || [ -z "$BASE_BRANCH" ]; then
-              echo "Error: Could not get branch information for PR #$PR"
+            echo "PR #$pr_number: $head_branch -> $base_branch"
+            
+            # Verify we got the branch names
+            if [ -z "$head_branch" ] || [ -z "$base_branch" ]; then
+              echo "ERROR: Failed to get branch names for PR #$pr_number"
               exit 1
             fi
             
-            # 3. Fetch the latest changes
+            # Fetch latest changes from both branches
             echo "Fetching latest changes..."
-            git fetch origin "$BASE_BRANCH"
-            git fetch origin "$HEAD_BRANCH"
+            git fetch origin "$base_branch"
+            git fetch origin "$head_branch"
             
-            # 4. Checkout and rebase the PR branch
-            echo "Rebasing $HEAD_BRANCH onto $BASE_BRANCH..."
-            git checkout "$HEAD_BRANCH"
-            if ! git rebase "origin/$BASE_BRANCH"; then
-              echo "Error:  Failed to rebase PR #$PR. There may be merge conflicts."
-              echo "Stopping execution to prevent issues."
+            # Checkout the PR branch
+            echo "Checking out $head_branch..."
+            git checkout "$head_branch"
+            
+            # Rebase onto the latest base branch
+            echo "Rebasing $head_branch onto origin/$base_branch..."
+            if ! git rebase "origin/$base_branch"; then
+              echo "ERROR:  Rebase failed for PR #$pr_number"
+              echo "There may be conflicts that need manual resolution"
               git rebase --abort
               exit 1
             fi
             
-            # 5. Force push the rebased branch
+            # Push the rebased branch
             echo "Pushing rebased branch..."
-            git push origin "$HEAD_BRANCH" --force-with-lease
-
-            # 6. Return to base branch for next iteration
-            git checkout "$BASE_BRANCH"
-
-            # 7. Attempt to merge
-            echo "Merging PR #$PR..."
-            if gh pr merge $PR --rebase --delete-branch; then
-              echo "Successfully merged PR #$PR"
-              
-              # 8. Wait for GitHub to process the merge
-              echo "Waiting for GitHub to process the merge..."
-              sleep 5
-              
-              # 9. Update our local base branch after merge
-              git fetch origin "$BASE_BRANCH"
-              git pull origin "$BASE_BRANCH"
-            else
-              echo "Error: Failed to merge PR #$PR."
-              echo "Stopping execution to prevent out-of-order merging or conflict issues."
+            if ! git push origin "$head_branch" --force-with-lease; then
+              echo "ERROR: Failed to push rebased branch for PR #$pr_number"
               exit 1
             fi
+            
+            # Switch back to base branch
+            git checkout "$base_branch"
+            
+            # Give GitHub a moment to register the push
+            sleep 3
+            
+            # Merge the PR
+            echo "Merging PR #$pr_number..."
+            if gh pr merge "$pr_number" --rebase --delete-branch; then
+              echo "✓ Successfully merged PR #$pr_number"
+            else
+              echo "ERROR: Failed to merge PR #$pr_number"
+              exit 1
+            fi
+            
+            # Wait for GitHub to process the merge
+            echo "Waiting for GitHub to process merge..."
+            sleep 5
+            
+            # Update local base branch
+            echo "Updating local $base_branch branch..."
+            git fetch origin "$base_branch"
+            git reset --hard "origin/$base_branch"
+            
+            echo ""
           done
-
-          echo "-----------------------------------"
-          echo "All PRs merged successfully!"
+          
+          echo "========================================="
+          echo "✓ All PRs merged successfully!"
+          echo "========================================="
