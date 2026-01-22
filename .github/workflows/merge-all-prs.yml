@@ -6,20 +6,21 @@ on:
 jobs:
   merge-prs:
     runs-on: ubuntu-latest
-    permissions: 
+    permissions:  
       pull-requests: write
       contents: write
 
     steps: 
-      - name: Checkout repository
+      - name:  Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for all branches
 
       - name: Rebase and Merge all open PRs (Oldest First)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 1. Get open PRs, sorted by created date in ascending order (oldest first)
-          # We set a high limit (e.g., 1000) to ensure we capture all open PRs
           PR_LIST=$(gh pr list --state open --limit 1000 --json number,createdAt --jq 'sort_by(.createdAt) | .[].number')
 
           if [ -z "$PR_LIST" ]; then
@@ -31,37 +32,53 @@ jobs:
             echo "-----------------------------------"
             echo "Processing oldest PR: #$PR"
 
-            # 2. Update the PR branch to ensure it's in sync with the base branch
-            echo "Updating PR #$PR branch..."
-            if ! gh pr view $PR --json headRefName,baseRefName -q '"\(.headRefName) \(.baseRefName)"' | read HEAD_BRANCH BASE_BRANCH; then
-              HEAD_BRANCH=$(gh pr view $PR --json headRefName -q '.headRefName')
-              BASE_BRANCH=$(gh pr view $PR --json baseRefName -q '.baseRefName')
+            # 2. Get PR branch information
+            echo "Getting PR #$PR branch information..."
+            HEAD_BRANCH=$(gh pr view $PR --json headRefName -q '. headRefName')
+            BASE_BRANCH=$(gh pr view $PR --json baseRefName -q '. baseRefName')
+            
+            echo "Head branch:  $HEAD_BRANCH"
+            echo "Base branch: $BASE_BRANCH"
+            
+            if [ -z "$HEAD_BRANCH" ] || [ -z "$BASE_BRANCH" ]; then
+              echo "Error: Could not get branch information for PR #$PR"
+              exit 1
             fi
             
-            echo "Head branch: $HEAD_BRANCH, Base branch: $BASE_BRANCH"
+            # 3. Fetch the latest changes
+            echo "Fetching latest changes..."
+            git fetch origin "$BASE_BRANCH"
+            git fetch origin "$HEAD_BRANCH"
             
-            # Fetch the latest changes
-            git fetch origin $BASE_BRANCH:$BASE_BRANCH || git fetch origin $BASE_BRANCH
-            git fetch origin $HEAD_BRANCH:$HEAD_BRANCH || git fetch origin $HEAD_BRANCH
-            
-            # Checkout and rebase the PR branch
-            git checkout $HEAD_BRANCH
-            if ! git rebase $BASE_BRANCH; then
+            # 4. Checkout and rebase the PR branch
+            echo "Rebasing $HEAD_BRANCH onto $BASE_BRANCH..."
+            git checkout "$HEAD_BRANCH"
+            if ! git rebase "origin/$BASE_BRANCH"; then
               echo "Error: Failed to rebase PR #$PR. There may be merge conflicts."
               echo "Stopping execution to prevent issues."
               git rebase --abort
               exit 1
             fi
             
-            # Force push the rebased branch
-            git push origin $HEAD_BRANCH --force-with-lease
+            # 5. Force push the rebased branch
+            echo "Pushing rebased branch..."
+            git push origin "$HEAD_BRANCH" --force-with-lease
 
-            # 3. Attempt to merge
+            # 6. Return to base branch for next iteration
+            git checkout "$BASE_BRANCH"
+
+            # 7. Attempt to merge
+            echo "Merging PR #$PR..."
             if gh pr merge $PR --rebase --delete-branch; then
               echo "Successfully merged PR #$PR"
+              # Update our local base branch after merge
+              git pull origin "$BASE_BRANCH"
             else
               echo "Error: Failed to merge PR #$PR."
               echo "Stopping execution to prevent out-of-order merging or conflict issues."
               exit 1
             fi
           done
+
+          echo "-----------------------------------"
+          echo "All PRs merged successfully!"
