@@ -1,68 +1,433 @@
-name: Merge All Pull Requests
+# .github/workflows/merge-all-prs.yml
+name: Merge All PRs (Oldest to Newest)
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (list PRs without merging)'
+        required: false
+        default: 'false'
+        type: boolean
+      merge_method:
+        description: 'Merge method'
+        required: false
+        default: 'squash'
+        type: choice
+        options:
+          - merge
+          - squash
+          - rebase
+      required_label:
+        description: 'Only merge PRs with this label (leave empty for all)'
+        required: false
+        default: ''
+        type: string
+      skip_label:
+        description: 'Skip PRs with this label'
+        required: false
+        default: 'do-not-merge'
+        type: string
+      max_prs:
+        description: 'Maximum number of PRs to merge (0 = unlimited)'
+        required: false
+        default: '0'
+        type: string
 
 permissions:
-  pull-requests: write
   contents: write
+  pull-requests: write
+  checks: read
 
 jobs:
-  merge-all-prs:
+  merge-prs:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 120
+    
     steps:
-      - name: Merge PRs sequentially
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge All PRs
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
+          REQUIRED_LABEL: ${{ inputs.required_label }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
+          MAX_PRS: ${{ inputs.max_prs }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const DRY_RUN = process.env.DRY_RUN === 'true';
+            const MERGE_METHOD = process.env.MERGE_METHOD || 'squash';
+            const REQUIRED_LABEL = process.env.REQUIRED_LABEL || '';
+            const SKIP_LABEL = process.env.SKIP_LABEL || 'do-not-merge';
+            const MAX_PRS = parseInt(process.env.MAX_PRS || '0', 10);
+            
+            // Configuration
+            const CONFIG = {
+              maxRetries: 3,
+              initialRetryDelay: 5000,        // 5 seconds
+              maxWaitForChecks: 600000,       // 10 minutes max wait for checks
+              checkPollInterval: 15000,       // Poll every 15 seconds
+              postMergeDelay: 3000,           // 3 seconds between merges
+              rateLimitBuffer: 100,           // Stop if remaining rate limit < 100
+            };
+
+            // Helper: Sleep function
+            const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+            // Helper: Exponential backoff
+            const exponentialBackoff = (attempt) => 
+              CONFIG.initialRetryDelay * Math.pow(2, attempt);
+
+            // Helper: Check rate limit
+            async function checkRateLimit() {
+              const { data: rateLimit } = await github.rest.rateLimit.get();
+              const remaining = rateLimit.resources.core.remaining;
+              const resetTime = new Date(rateLimit.resources.core.reset * 1000);
+              
+              console.log(`📊 Rate limit: ${remaining} remaining, resets at ${resetTime.toISOString()}`);
+              
+              if (remaining < CONFIG.rateLimitBuffer) {
+                const waitTime = resetTime - Date.now() + 1000;
+                console.log(`⏳ Rate limit low. Waiting ${Math.ceil(waitTime / 1000)} seconds...`);
+                await sleep(waitTime);
+              }
+              
+              return remaining;
+            }
+
+            // Helper: Get all open PRs sorted by creation date (oldest first)
+            async function getAllOpenPRs() {
+              const prs = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                sort: 'created',
+                direction: 'asc',
+                per_page: 100,
+              });
+              
+              return prs;
+            }
+
+            // Helper: Filter PRs based on labels
+            function filterPRs(prs) {
+              return prs.filter(pr => {
+                const labels = pr.labels.map(l => l.name);
+                
+                // Skip drafts
+                if (pr.draft) {
+                  console.log(`⏭️  Skipping PR #${pr.number} (draft)`);
+                  return false;
+                }
+                
+                // Skip if has skip label
+                if (SKIP_LABEL && labels.includes(SKIP_LABEL)) {
+                  console.log(`⏭️  Skipping PR #${pr.number} (has '${SKIP_LABEL}' label)`);
+                  return false;
+                }
+                
+                // Skip if required label is set and PR doesn't have it
+                if (REQUIRED_LABEL && !labels.includes(REQUIRED_LABEL)) {
+                  console.log(`⏭️  Skipping PR #${pr.number} (missing '${REQUIRED_LABEL}' label)`);
+                  return false;
+                }
+                
+                return true;
+              });
+            }
+
+            // Helper: Check if PR is mergeable
+            async function checkMergeability(prNumber) {
+              // Need to fetch individual PR for mergeable status
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              
+              // GitHub may return null initially while computing
+              if (pr.mergeable === null) {
+                console.log(`⏳ Mergeability being computed for PR #${prNumber}...`);
+                await sleep(3000);
+                return checkMergeability(prNumber);
+              }
+              
+              return {
+                mergeable: pr.mergeable,
+                mergeableState: pr.mergeable_state,
+                rebaseable: pr.rebaseable,
+                merged: pr.merged,
+              };
+            }
+
+            // Helper: Wait for all required status checks to pass
+            async function waitForChecks(prNumber, sha) {
+              const startTime = Date.now();
+              
+              while (Date.now() - startTime < CONFIG.maxWaitForChecks) {
+                await checkRateLimit();
+                
+                // Get combined status (legacy status API)
+                const { data: status } = await github.rest.repos.getCombinedStatusForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: sha,
+                });
+                
+                // Get check runs (modern checks API)
+                const { data: checkRuns } = await github.rest.checks.listForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: sha,
+                });
+                
+                const pendingChecks = checkRuns.check_runs.filter(
+                  c => c.status !== 'completed'
+                );
+                
+                const failedChecks = checkRuns.check_runs.filter(
+                  c => c.status === 'completed' && 
+                       c.conclusion !== 'success' && 
+                       c.conclusion !== 'skipped' &&
+                       c.conclusion !== 'neutral'
+                );
+                
+                console.log(`   Status: ${status.state}, Pending: ${pendingChecks.length}, Failed: ${failedChecks.length}`);
+                
+                // If any check failed, return failure
+                if (failedChecks.length > 0 || status.state === 'failure') {
+                  const failedNames = failedChecks.map(c => c.name).join(', ');
+                  return { 
+                    success: false, 
+                    reason: `Failed checks: ${failedNames || status.state}` 
+                  };
+                }
+                
+                // If all checks passed and status is success
+                if (pendingChecks.length === 0 && 
+                    (status.state === 'success' || status.total_count === 0)) {
+                  return { success: true };
+                }
+                
+                console.log(`   ⏳ Waiting for ${pendingChecks.length} pending checks...`);
+                await sleep(CONFIG.checkPollInterval);
+              }
+              
+              return { success: false, reason: 'Timeout waiting for checks' };
+            }
+
+            // Helper: Update branch if behind
+            async function updateBranch(prNumber) {
+              try {
+                await github.rest.pulls.updateBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                });
+                console.log(`   🔄 Branch updated for PR #${prNumber}`);
+                await sleep(5000); // Wait for update to propagate
+                return true;
+              } catch (error) {
+                console.log(`   ⚠️  Could not update branch: ${error.message}`);
+                return false;
+              }
+            }
+
+            // Helper: Merge a single PR with retries
+            async function mergePR(pr) {
+              const prNumber = pr.number;
+              console.log(`\n🔀 Processing PR #${prNumber}: "${pr.title}"`);
+              console.log(`   Created: ${pr.created_at}`);
+              console.log(`   Author: ${pr.user.login}`);
+              
+              if (DRY_RUN) {
+                console.log(`   🏃 DRY RUN: Would merge PR #${prNumber}`);
+                return { success: true, dryRun: true };
+              }
+              
+              for (let attempt = 0; attempt < CONFIG.maxRetries; attempt++) {
+                try {
+                  await checkRateLimit();
+                  
+                  // Check mergeability
+                  const mergeStatus = await checkMergeability(prNumber);
+                  
+                  if (mergeStatus.merged) {
+                    console.log(`   ✅ PR #${prNumber} already merged`);
+                    return { success: true, alreadyMerged: true };
+                  }
+                  
+                  if (!mergeStatus.mergeable) {
+                    // Try to update branch if behind
+                    if (mergeStatus.mergeableState === 'behind') {
+                      console.log(`   📥 PR is behind base branch, attempting update...`);
+                      const updated = await updateBranch(prNumber);
+                      if (updated) {
+                        continue; // Retry after update
+                      }
+                    }
+                    
+                    console.log(`   ❌ PR #${prNumber} not mergeable (state: ${mergeStatus.mergeableState})`);
+                    return { 
+                      success: false, 
+                      reason: `Not mergeable: ${mergeStatus.mergeableState}` 
+                    };
+                  }
+                  
+                  // Get fresh PR data for SHA
+                  const { data: freshPR } = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: prNumber,
+                  });
+                  
+                  // Wait for checks
+                  console.log(`   🔍 Checking status checks...`);
+                  const checksResult = await waitForChecks(prNumber, freshPR.head.sha);
+                  
+                  if (!checksResult.success) {
+                    console.log(`   ❌ ${checksResult.reason}`);
+                    return { success: false, reason: checksResult.reason };
+                  }
+                  
+                  // Perform merge
+                  console.log(`   🚀 Merging with method: ${MERGE_METHOD}...`);
+                  
+                  await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: prNumber,
+                    merge_method: MERGE_METHOD,
+                    commit_title: `${pr.title} (#${prNumber})`,
+                  });
+                  
+                  console.log(`   ✅ Successfully merged PR #${prNumber}`);
+                  
+                  // Wait before next merge to allow CI to catch up
+                  await sleep(CONFIG.postMergeDelay);
+                  
+                  return { success: true };
+                  
+                } catch (error) {
+                  const isRetryable = error.status === 405 || // Method not allowed (merge conflict appeared)
+                                      error.status === 409 || // Conflict
+                                      error.status === 422 || // Unprocessable (often transient)
+                                      error.status === 502 || // Bad gateway
+                                      error.status === 503;   // Service unavailable
+                  
+                  console.log(`   ⚠️  Attempt ${attempt + 1}/${CONFIG.maxRetries} failed: ${error.message}`);
+                  
+                  if (!isRetryable || attempt === CONFIG.maxRetries - 1) {
+                    console.log(`   ❌ Failed to merge PR #${prNumber}: ${error.message}`);
+                    return { success: false, reason: error.message };
+                  }
+                  
+                  const delay = exponentialBackoff(attempt);
+                  console.log(`   ⏳ Retrying in ${delay / 1000} seconds...`);
+                  await sleep(delay);
+                }
+              }
+              
+              return { success: false, reason: 'Max retries exceeded' };
+            }
+
+            // Main execution
+            async function main() {
+              console.log('🚀 Starting PR merge workflow');
+              console.log(`📋 Configuration:`);
+              console.log(`   - Dry run: ${DRY_RUN}`);
+              console.log(`   - Merge method: ${MERGE_METHOD}`);
+              console.log(`   - Required label: ${REQUIRED_LABEL || '(none)'}`);
+              console.log(`   - Skip label: ${SKIP_LABEL || '(none)'}`);
+              console.log(`   - Max PRs: ${MAX_PRS || 'unlimited'}`);
+              
+              await checkRateLimit();
+              
+              // Get all open PRs
+              console.log('\n📥 Fetching open PRs...');
+              const allPRs = await getAllOpenPRs();
+              console.log(`   Found ${allPRs.length} open PRs`);
+              
+              // Filter PRs
+              const eligiblePRs = filterPRs(allPRs);
+              console.log(`   ${eligiblePRs.length} PRs eligible for merge`);
+              
+              // Apply max limit
+              const prsToProcess = MAX_PRS > 0 
+                ? eligiblePRs.slice(0, MAX_PRS) 
+                : eligiblePRs;
+              
+              if (prsToProcess.length === 0) {
+                console.log('\n✨ No PRs to merge!');
+                return;
+              }
+              
+              console.log(`\n📝 PRs to process (oldest to newest):`);
+              prsToProcess.forEach((pr, i) => {
+                console.log(`   ${i + 1}. PR #${pr.number}: ${pr.title} (${pr.created_at})`);
+              });
+              
+              // Process PRs
+              const results = {
+                merged: [],
+                failed: [],
+                skipped: [],
+              };
+              
+              for (const pr of prsToProcess) {
+                const result = await mergePR(pr);
+                
+                if (result.success) {
+                  if (result.dryRun) {
+                    results.skipped.push({ pr, reason: 'Dry run' });
+                  } else if (result.alreadyMerged) {
+                    results.skipped.push({ pr, reason: 'Already merged' });
+                  } else {
+                    results.merged.push(pr);
+                  }
+                } else {
+                  results.failed.push({ pr, reason: result.reason });
+                }
+              }
+              
+              // Summary
+              console.log('\n' + '='.repeat(60));
+              console.log('📊 SUMMARY');
+              console.log('='.repeat(60));
+              console.log(`✅ Merged: ${results.merged.length}`);
+              results.merged.forEach(pr => console.log(`   - PR #${pr.number}: ${pr.title}`));
+              
+              console.log(`\n❌ Failed: ${results.failed.length}`);
+              results.failed.forEach(({ pr, reason }) => 
+                console.log(`   - PR #${pr.number}: ${pr.title} (${reason})`));
+              
+              console.log(`\n⏭️  Skipped: ${results.skipped.length}`);
+              results.skipped.forEach(({ pr, reason }) => 
+                console.log(`   - PR #${pr.number}: ${pr.title} (${reason})`));
+              
+              // Set outputs for potential downstream jobs
+              core.setOutput('merged_count', results.merged.length);
+              core.setOutput('failed_count', results.failed.length);
+              core.setOutput('merged_prs', results.merged.map(p => p.number).join(','));
+              
+              // Fail if any PR failed (except in dry run)
+              if (results.failed.length > 0 && !DRY_RUN) {
+                core.setFailed(`Failed to merge ${results.failed.length} PR(s)`);
+              }
+            }
+            
+            await main();
+
+      - name: Summary
+        if: always()
         run: |
-          echo "Fetching open PRs (oldest first)..."
-
-          prs=$(gh pr list \
-            --state open \
-            --limit 1000 \
-            --json number,createdAt,mergeable \
-            --jq 'sort_by(.createdAt) | .[].number')
-
-          if [ -z "$prs" ]; then
-            echo "✓ No open PRs found"
-            exit 0
-          fi
-
-          echo "Found PRs:"
-          echo "$prs"
-          echo ""
-
-          for pr in $prs; do
-            echo "========================================="
-            echo "Processing PR #$pr"
-            echo "========================================="
-
-            mergeable=$(gh pr view "$pr" --json mergeable --jq '.mergeable')
-
-            if [ "$mergeable" != "MERGEABLE" ]; then
-              echo "⚠ PR #$pr is not mergeable (state: $mergeable)"
-              echo "Stopping to avoid inconsistent state."
-              exit 1
-            fi
-
-            echo "Merging PR #$pr..."
-
-            if gh pr merge "$pr" \
-              --rebase \
-              --delete-branch \
-              --auto; then
-              echo "✓ PR #$pr merged successfully"
-            else
-              echo "✗ Failed to merge PR #$pr"
-              exit 1
-            fi
-
-            echo "Waiting for GitHub to update branch..."
-            sleep 5
-            echo ""
-          done
-
-          echo "========================================="
-          echo "✓ All PRs merged successfully"
-          echo "========================================="
+          echo "## 🔀 PR Merge Workflow Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the logs above for detailed results." >> $GITHUB_STEP_SUMMARY
