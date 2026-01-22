@@ -1,14 +1,14 @@
 name: Merge All Pull Requests
 
-on:
+on:  
   workflow_dispatch: # Allows manual trigger from the UI
 
-jobs:
-  merge-prs:
+jobs: 
+  merge-prs: 
     runs-on: ubuntu-latest
-    permissions:  
+    permissions:   
       pull-requests: write
-      contents: write
+      contents:  write
 
     steps: 
       - name:  Checkout repository
@@ -16,9 +16,9 @@ jobs:
         with:
           fetch-depth: 0  # Fetch all history for all branches
 
-      - name: Rebase and Merge all open PRs (Oldest First)
+      - name:  Rebase and Merge all open PRs (Oldest First)
         env:
-          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 1. Get open PRs, sorted by created date in ascending order (oldest first)
           PR_LIST=$(gh pr list --state open --limit 1000 --json number,createdAt --jq 'sort_by(.createdAt) | .[].number')
@@ -54,7 +54,7 @@ jobs:
             echo "Rebasing $HEAD_BRANCH onto $BASE_BRANCH..."
             git checkout "$HEAD_BRANCH"
             if ! git rebase "origin/$BASE_BRANCH"; then
-              echo "Error: Failed to rebase PR #$PR. There may be merge conflicts."
+              echo "Error:  Failed to rebase PR #$PR. There may be merge conflicts."
               echo "Stopping execution to prevent issues."
               git rebase --abort
               exit 1
@@ -71,7 +71,13 @@ jobs:
             echo "Merging PR #$PR..."
             if gh pr merge $PR --rebase --delete-branch; then
               echo "Successfully merged PR #$PR"
-              # Update our local base branch after merge
+              
+              # 8. Wait for GitHub to process the merge
+              echo "Waiting for GitHub to process the merge..."
+              sleep 5
+              
+              # 9. Update our local base branch after merge
+              git fetch origin "$BASE_BRANCH"
               git pull origin "$BASE_BRANCH"
             else
               echo "Error: Failed to merge PR #$PR."
