@@ -6,11 +6,11 @@ on:
 jobs:
   merge-prs:
     runs-on: ubuntu-latest
-    permissions:
+    permissions: 
       pull-requests: write
       contents: write
 
-    steps:
+    steps: 
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -31,7 +31,32 @@ jobs:
             echo "-----------------------------------"
             echo "Processing oldest PR: #$PR"
 
-            # 2. Attempt to rebase and merge
+            # 2. Update the PR branch to ensure it's in sync with the base branch
+            echo "Updating PR #$PR branch..."
+            if ! gh pr view $PR --json headRefName,baseRefName -q '"\(.headRefName) \(.baseRefName)"' | read HEAD_BRANCH BASE_BRANCH; then
+              HEAD_BRANCH=$(gh pr view $PR --json headRefName -q '.headRefName')
+              BASE_BRANCH=$(gh pr view $PR --json baseRefName -q '.baseRefName')
+            fi
+            
+            echo "Head branch: $HEAD_BRANCH, Base branch: $BASE_BRANCH"
+            
+            # Fetch the latest changes
+            git fetch origin $BASE_BRANCH:$BASE_BRANCH || git fetch origin $BASE_BRANCH
+            git fetch origin $HEAD_BRANCH:$HEAD_BRANCH || git fetch origin $HEAD_BRANCH
+            
+            # Checkout and rebase the PR branch
+            git checkout $HEAD_BRANCH
+            if ! git rebase $BASE_BRANCH; then
+              echo "Error: Failed to rebase PR #$PR. There may be merge conflicts."
+              echo "Stopping execution to prevent issues."
+              git rebase --abort
+              exit 1
+            fi
+            
+            # Force push the rebased branch
+            git push origin $HEAD_BRANCH --force-with-lease
+
+            # 3. Attempt to merge
             if gh pr merge $PR --rebase --delete-branch; then
               echo "Successfully merged PR #$PR"
             else
